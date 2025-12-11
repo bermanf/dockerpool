@@ -6,6 +6,7 @@ require (
 	github.com/moby/moby/api v1.52.0
 	github.com/moby/moby/client v0.1.0
 	github.com/stretchr/testify v1.10.0
+	golang.org/x/sync v0.19.0
 )
 
 require (

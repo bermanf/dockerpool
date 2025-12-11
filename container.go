@@ -14,6 +14,7 @@ type Container interface {
 	Labels() map[string]string
 	State() ContainerState
 	Stop(ctx context.Context) error
+	Start(ctx context.Context) error
 	Exec(ctx context.Context, cmd []string) (*ExecResult, error)
 	ExecStd(ctx context.Context, cmd []string, opts ExecOptions) (*ExecResult, error)
 	ExecStream(ctx context.Context, cmd []string, stdout, stderr io.Writer, opts ExecOptions) (exitCode int, err error)
@@ -67,6 +68,15 @@ func (c *ContainerClient) Stop(ctx context.Context) error {
 		return err
 	}
 	c.state = StateExited
+	return nil
+}
+
+func (c *ContainerClient) Start(ctx context.Context) error {
+	err := c.docker.StartContainer(ctx, c.id, client.ContainerStartOptions{})
+	if err != nil {
+		return err
+	}
+	c.state = StateRunning
 	return nil
 }
 

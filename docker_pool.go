@@ -9,45 +9,151 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	"golang.org/x/sync/errgroup"
 )
 
+// Config contains all configuration for creating a DockerPool.
+type Config struct {
+	// Required
+	Name    string        // pool name (used for container labels)
+	Network NetworkConfig // docker network configuration
+	Image   ImageConfig   // container image configuration
+
+	// Optional - have sensible defaults
+	Cmd                    []string      // container command (default: ["sleep", "infinity"])
+	MinIdle                int           // minimum idle containers (default: 5)
+	MaxIdle                int           // maximum idle containers (default: 10)
+	RefillInterval         time.Duration // pool refill check interval (default: 100ms)
+	MaxConcurrentDockerOps int           // max parallel docker operations (default: 10)
+	MaxConcurrentAcquire   int           // max parallel container acquisition (default: 10)
+	MaxRefillWorkers       int           // max parallel container creation goroutines (default: 5)
+
+	// Advanced - for custom container configuration
+	ContainerConfig *container.Config     // custom container config (overrides Image, Cmd)
+	HostConfig      *container.HostConfig // custom host config (volumes, resources, etc.)
+	Labels          map[string]string     // additional container labels
+
+	// Callbacks
+	OnError func(error) // error handler (default: log.Printf)
+}
+
+type NetworkConfig struct {
+	Name        string
+	Driver      string
+	Labels      map[string]string
+	NeedsCreate bool
+	NeedsRemove bool
+}
+
+type ImageConfig struct {
+	Name      string
+	NeedsPull bool
+}
+
+// DockerPool manages a pool of Docker containers.
 type DockerPool struct {
-	docker          Docker
-	pool            Pool[Container]
-	name            string
-	networkName     string
+	docker Docker
+	stack  Stack[Container]
+	config Config
+
 	containerConfig CreateContainerOptions
+	inUse           atomic.Int64
+	minIdle         int
+	maxIdle         int
 
-	inUse   atomic.Int64 // containers currently in use
-	minIdle int          // minimum idle containers in the pool
-	maxIdle int          // maximum idle containers (excess are removed on Return)
-
-	refillInterval         time.Duration // pool refill interval
-	maxConcurrentDockerOps int           // maximum concurrent Docker operations
+	refillInterval         time.Duration
+	maxConcurrentDockerOps int
+	maxConcurrentAcquire   int
 
 	onError        func(error)
 	cancel         context.CancelFunc
 	watcherDone    chan struct{}
+	released       chan struct{}
+	acquireLimiter chan struct{}
 	watcherStarted atomic.Bool
+	ownsDocker     bool
+
+	shutdown atomic.Bool    // true after Shutdown is called
+	removeWg sync.WaitGroup // tracks in-flight removeContainer goroutines
 }
 
-func NewDockerPool(ctx context.Context, docker Docker, poolName string, networkName string, config DockerPoolConfig) (*DockerPool, error) {
-	if poolName == "" {
-		return nil, ErrPoolNameRequired
+// New creates a new DockerPool.
+// This is the main entry point for users.
+func New(ctx context.Context, cfg Config) (*DockerPool, error) {
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
 	}
-	if networkName == "" {
-		return nil, ErrNetworkNameRequired
+
+	docker, err := newDockerClient()
+	if err != nil {
+		return nil, fmt.Errorf("create docker client: %w", err)
 	}
+	// Ensure network exists
+	if cfg.Network.NeedsCreate {
+		if _, err := docker.EnsureNetwork(ctx, cfg.Network.Name, cfg.Network.Driver, cfg.Network.Labels); err != nil {
+			docker.Close()
+			return nil, fmt.Errorf("ensure network: %w", err)
+		}
+	}
+	// Pull image if requested
+	if cfg.Image.NeedsPull {
+		if err := docker.PullImage(ctx, cfg.Image.Name); err != nil {
+			docker.Close()
+			return nil, fmt.Errorf("pull image: %w", err)
+		}
+	}
+
+	pool, err := newDockerPool(ctx, docker, cfg)
+	if err != nil {
+		docker.Close()
+		return nil, err
+	}
+
+	pool.ownsDocker = true
+	return pool, nil
+}
+
+// NewWithDocker creates a pool with a provided Docker implementation.
+// Use this for testing with mocks or custom Docker clients.
+func NewWithDocker(ctx context.Context, docker Docker, cfg Config) (*DockerPool, error) {
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
+	}
+	return newDockerPool(ctx, docker, cfg)
+}
+
+func validateConfig(cfg *Config) error {
+	if cfg.Name == "" {
+		return ErrPoolNameRequired
+	}
+	if cfg.Network.Name == "" {
+		return ErrNetworkNameRequired
+	}
+	if cfg.Image.Name == "" {
+		return ErrImageRequired
+	}
+	return nil
+}
+
+func newDockerPool(ctx context.Context, docker Docker, cfg Config) (*DockerPool, error) {
 	p := &DockerPool{
-		docker:      docker,
-		name:        poolName,
-		networkName: networkName,
-		pool:        NewPool[Container](),
+		docker: docker,
+		stack:  NewStack[Container](),
+		config: cfg,
+
+		released: make(chan struct{}),
 	}
 
-	applyConfig(p, config)
+	applyConfig(p, cfg)
 
-	p.containerConfig.Config.Labels = MergeLabels(p.containerConfig.Config.Labels, PoolLabels(poolName))
+	// Initialize acquire limiter (limits concurrent container creation when pool is empty)
+	p.acquireLimiter = make(chan struct{}, p.maxConcurrentAcquire)
+
+	// Add pool labels
+	p.containerConfig.Config.Labels = MergeLabels(
+		p.containerConfig.Config.Labels,
+		PoolLabels(cfg.Name),
+	)
 
 	// Auto-start watcher
 	if err := p.startWatcher(ctx); err != nil {
@@ -55,90 +161,69 @@ func NewDockerPool(ctx context.Context, docker Docker, poolName string, networkN
 	}
 
 	p.watcherStarted.Store(true)
-
 	return p, nil
 }
 
-type DockerPoolConfig struct {
-	// Error handling
-	OnError func(error)
-
-	// Container configuration
-	ContainerConfig CreateContainerOptions
-	Labels          map[string]string
-
-	// Pool sizing
-	MinIdle int
-	MaxIdle int
-
-	// Timing
-	RefillInterval time.Duration
-
-	// Concurrency limits
-	MaxConcurrentDockerOps int
-}
-
-// DefaultDockerPoolConfig returns a config with sensible defaults
-func DefaultDockerPoolConfig() DockerPoolConfig {
-	return DockerPoolConfig{
-		OnError: func(err error) {
-			log.Printf("error: %v", err)
-		},
-		ContainerConfig: CreateContainerOptions{
-			Config: &container.Config{
-				Image: "alpine:latest",
-				Cmd:   []string{"sleep", "infinity"},
-			},
-			HostConfig: &container.HostConfig{},
-		},
-		MinIdle:                5,
-		MaxIdle:                10,
-		RefillInterval:         100 * time.Millisecond,
-		MaxConcurrentDockerOps: 10,
-	}
-}
-
-func applyConfig(p *DockerPool, config DockerPoolConfig) {
-	// Apply defaults
-	if config.OnError == nil {
-		config.OnError = func(err error) {
-			log.Printf("error: %v", err)
+func applyConfig(p *DockerPool, cfg Config) {
+	// Defaults
+	if cfg.OnError == nil {
+		cfg.OnError = func(err error) {
+			log.Printf("dockerpool error: %v", err)
 		}
 	}
-	if config.ContainerConfig.Config == nil {
-		config.ContainerConfig = CreateContainerOptions{
-			Config: &container.Config{
-				Image: "alpine:latest",
-				Cmd:   []string{"sleep", "infinity"},
-			},
-			HostConfig: &container.HostConfig{},
+	if cfg.MinIdle == 0 {
+		cfg.MinIdle = 5
+	}
+	if cfg.MaxIdle == 0 {
+		cfg.MaxIdle = 10
+	}
+	if cfg.RefillInterval == 0 {
+		cfg.RefillInterval = 100 * time.Millisecond
+	}
+	if cfg.MaxConcurrentDockerOps == 0 {
+		cfg.MaxConcurrentDockerOps = 10
+	}
+	if cfg.MaxConcurrentAcquire == 0 {
+		cfg.MaxConcurrentAcquire = 10
+	}
+	if cfg.MaxRefillWorkers == 0 {
+		cfg.MaxRefillWorkers = 5
+	}
+	if len(cfg.Cmd) == 0 {
+		cfg.Cmd = []string{"sleep", "infinity"}
+	}
+
+	// Build container config
+	if cfg.ContainerConfig != nil {
+		p.containerConfig.Config = cfg.ContainerConfig
+	} else {
+		p.containerConfig.Config = &container.Config{
+			Image: cfg.Image.Name,
+			Cmd:   cfg.Cmd,
 		}
 	}
-	if config.MinIdle == 0 {
-		config.MinIdle = 5
-	}
-	if config.MaxIdle == 0 {
-		config.MaxIdle = 10
-	}
-	if config.RefillInterval == 0 {
-		config.RefillInterval = 100 * time.Millisecond
-	}
-	if config.MaxConcurrentDockerOps == 0 {
-		config.MaxConcurrentDockerOps = 10
+
+	if cfg.HostConfig != nil {
+		p.containerConfig.HostConfig = cfg.HostConfig
+	} else {
+		p.containerConfig.HostConfig = &container.HostConfig{}
 	}
 
-	// Apply config to pool
-	p.onError = config.OnError
-	p.containerConfig = config.ContainerConfig
-	p.minIdle = config.MinIdle
-	p.maxIdle = config.MaxIdle
-	p.refillInterval = config.RefillInterval
-	p.maxConcurrentDockerOps = config.MaxConcurrentDockerOps
-
-	// Merge labels
-	if config.Labels != nil {
-		p.containerConfig.Config.Labels = MergeLabels(p.containerConfig.Config.Labels, config.Labels)
+	// Merge custom labels
+	if cfg.Labels != nil {
+		p.containerConfig.Config.Labels = MergeLabels(
+			p.containerConfig.Config.Labels,
+			cfg.Labels,
+		)
 	}
+
+	// Apply to pool
+	p.onError = cfg.OnError
+	p.minIdle = cfg.MinIdle
+	p.maxIdle = cfg.MaxIdle
+	p.refillInterval = cfg.RefillInterval
+	p.maxConcurrentDockerOps = cfg.MaxConcurrentDockerOps
+	p.maxConcurrentAcquire = cfg.MaxConcurrentAcquire
 }
 
 func (p *DockerPool) startWatcher(ctx context.Context) error {
@@ -154,7 +239,9 @@ func (p *DockerPool) startWatcher(ctx context.Context) error {
 	p.watcherDone = make(chan struct{})
 
 	// Initial fill to minIdle
-	p.refill(ctx)
+	if err := p.refill(ctx); err != nil {
+		return fmt.Errorf("initial refill: %w", err)
+	}
 
 	go func() {
 		ticker := time.NewTicker(p.refillInterval)
@@ -166,7 +253,9 @@ func (p *DockerPool) startWatcher(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				p.refill(ctx)
+				if err := p.refill(ctx); err != nil {
+					p.onError(fmt.Errorf("refill: %w", err))
+				}
 			}
 		}
 	}()
@@ -174,60 +263,74 @@ func (p *DockerPool) startWatcher(ctx context.Context) error {
 }
 
 // refill refills the pool to minIdle
-func (p *DockerPool) refill(ctx context.Context) {
-	idle := p.pool.Len()
-	needed := p.minIdle - idle
+func (p *DockerPool) refill(ctx context.Context) error {
+	available := p.stack.Len()
+	desired := p.minIdle - available
 
 	dockerOpsLimiter := make(chan struct{}, p.maxConcurrentDockerOps)
-	var wg sync.WaitGroup
+	defer close(dockerOpsLimiter)
+	eg := errgroup.Group{}
+	eg.SetLimit(p.maxConcurrentDockerOps)
 
-	for i := 0; i < needed; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		case dockerOpsLimiter <- struct{}{}:
+	for range desired {
+		if ctx.Err() != nil {
+			break
 		}
 
-		wg.Add(1)
-		go func() {
-			defer func() { <-dockerOpsLimiter }()
-			defer wg.Done()
-			c, err := p.docker.CreateContainer(ctx, p.networkName, p.containerConfig)
-			if err != nil {
-				p.onError(fmt.Errorf("refill: %w", err))
-				return
+		eg.Go(func() error {
+			c, err := p.docker.CreateContainer(ctx, p.config.Network.Name, p.containerConfig)
+			if err == nil {
+				p.stack.Push(c)
 			}
-			p.pool.Push(c)
-		}()
+
+			return err
+		})
 	}
 
-	wg.Wait()
+	return eg.Wait()
 }
 
 func (p *DockerPool) syncDockerPool(ctx context.Context) error {
 	containers, err := p.docker.ListContainersByLabels(ctx,
 		Label{Key: LabelManagedBy, Value: LabelManagedByValue},
-		Label{Key: LabelPoolName, Value: p.name},
+		Label{Key: LabelPoolName, Value: p.config.Name},
 	)
 	if err != nil {
 		return fmt.Errorf("list containers: %w", err)
 	}
 	for _, container := range containers {
-		p.pool.Push(container)
+		p.stack.Push(container)
 	}
 	return nil
 }
 
 // Acquire gets a container from the pool or creates a new one.
 // After use, you must call Return() or Remove().
+// Returns ErrPoolShutdown if the pool has been shut down.
 func (p *DockerPool) Acquire(ctx context.Context) (Container, error) {
-	if c, ok := p.pool.Pop(); ok {
+	if p.shutdown.Load() {
+		return nil, ErrPoolShutdown
+	}
+
+	if c, ok := p.stack.Pop(); ok {
 		p.inUse.Add(1)
 		return c, nil
 	}
 
+	// Check again after pool was empty (shutdown might have started)
+	if p.shutdown.Load() {
+		return nil, ErrPoolShutdown
+	}
+
+	select {
+	case p.acquireLimiter <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-p.acquireLimiter }()
+
 	// Pool is empty — create container synchronously
-	container, err := p.docker.CreateContainer(ctx, p.networkName, p.containerConfig)
+	container, err := p.docker.CreateContainer(ctx, p.config.Network.Name, p.containerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
 	}
@@ -236,7 +339,11 @@ func (p *DockerPool) Acquire(ctx context.Context) (Container, error) {
 	return container, nil
 }
 
+// Shutdown gracefully shuts down the pool.
+// It waits for all in-use containers to be returned, then removes all containers.
 func (p *DockerPool) Shutdown(ctx context.Context) error {
+	p.shutdown.Store(true)
+
 	if p.cancel != nil {
 		p.cancel()
 	}
@@ -244,27 +351,27 @@ func (p *DockerPool) Shutdown(ctx context.Context) error {
 		select {
 		case <-p.watcherDone:
 		case <-ctx.Done():
-			return fmt.Errorf("wait for replenisher: %w", ctx.Err())
+			return fmt.Errorf("wait for watcher: %w", ctx.Err())
 		}
 	}
 
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
 	// Wait for all containers to be returned
 	for p.inUse.Load() > 0 {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("wait for containers: %w", ctx.Err())
-		case <-ticker.C:
+		case <-p.released:
 		}
 	}
 
-	// Remove all containers from pool
+	// Wait for any in-flight removeContainer goroutines from Return/Remove
+	p.removeWg.Wait()
+
 	dockerOpsLimiter := make(chan struct{}, p.maxConcurrentDockerOps)
 	var wg sync.WaitGroup
 
 	for {
-		c, ok := p.pool.Pop()
+		c, ok := p.stack.Pop()
 		if !ok {
 			break
 		}
@@ -280,45 +387,76 @@ func (p *DockerPool) Shutdown(ctx context.Context) error {
 				defer func() { <-dockerOpsLimiter }()
 			}
 
-			p.removeContainer(ctx, container)
+			// Direct removal without containerReleased (shutdown is true)
+			if err := p.docker.RemoveContainer(ctx, container.ID()); err != nil {
+				p.onError(fmt.Errorf("remove container: %w", err))
+			}
 		}(c)
 	}
 
 	wg.Wait()
+
+	if p.config.Network.NeedsRemove {
+		if err := p.docker.RemoveNetwork(ctx, p.config.Network.Name); err != nil {
+			return fmt.Errorf("remove network: %w", err)
+		}
+	}
+	if p.ownsDocker {
+		if err := p.docker.Close(); err != nil {
+			return fmt.Errorf("close docker client: %w", err)
+		}
+	}
+
 	return nil
 }
 
-// InUse returns the number of containers currently in use
+// InUse returns the number of containers currently in use.
 func (p *DockerPool) InUse() int64 {
 	return p.inUse.Load()
 }
 
-// IdleCount returns the number of idle containers in the pool
+// IdleCount returns the number of idle containers in the pool.
 func (p *DockerPool) IdleCount() int {
-	return p.pool.Len()
+	return p.stack.Len()
 }
 
 // Return returns the container to the pool.
-// If the pool is full (>= maxIdle), the container is removed.
+// If the pool is full (>= maxIdle) or shutdown is in progress, the container is removed.
 func (p *DockerPool) Return(ctx context.Context, c Container) {
 	p.inUse.Add(-1)
 
-	// If pool is already full — remove the container
-	if p.pool.Len() >= p.maxIdle {
-		go p.removeContainer(ctx, c)
+	if p.shutdown.Load() || p.stack.Len() >= p.maxIdle {
+		p.removeWg.Add(1)
+		go func() {
+			defer p.removeWg.Done()
+			p.removeContainer(ctx, c)
+		}()
 		return
 	}
-	p.pool.Push(c)
+	p.stack.Push(c)
+	p.containerReleased()
 }
 
-// Remove removes the container (does not return it to the pool)
+// Remove removes the container (does not return it to the pool).
 func (p *DockerPool) Remove(ctx context.Context, c Container) {
 	p.inUse.Add(-1)
-	go p.removeContainer(ctx, c)
+	p.removeWg.Add(1)
+	go func() {
+		defer p.removeWg.Done()
+		p.removeContainer(ctx, c)
+	}()
 }
 
 func (p *DockerPool) removeContainer(ctx context.Context, c Container) {
 	if err := p.docker.RemoveContainer(ctx, c.ID()); err != nil {
 		p.onError(fmt.Errorf("remove container: %w", err))
+	}
+	p.containerReleased()
+}
+
+func (p *DockerPool) containerReleased() {
+	select {
+	case p.released <- struct{}{}:
+	default:
 	}
 }

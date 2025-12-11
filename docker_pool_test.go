@@ -3,8 +3,10 @@ package dockerpool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +29,18 @@ type MockDocker struct {
 	RemoveContainerCalls int
 }
 
+func (m *MockDocker) GetRemoveContainerCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.RemoveContainerCalls
+}
+
+func (m *MockDocker) GetCreateContainerCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.CreateContainerCalls
+}
+
 func (m *MockDocker) Close() error { return nil }
 
 func (m *MockDocker) Ping(ctx context.Context) error {
@@ -40,8 +54,12 @@ func (m *MockDocker) SetCleanupTimeout(timeout time.Duration) {}
 
 func (m *MockDocker) PullImage(ctx context.Context, image string) error { return nil }
 
-func (m *MockDocker) EnsureNetwork(ctx context.Context, networkName string) (bool, error) {
+func (m *MockDocker) EnsureNetwork(ctx context.Context, networkName string, driver string, labels map[string]string) (bool, error) {
 	return false, nil
+}
+
+func (m *MockDocker) StartContainer(ctx context.Context, containerID string, opts client.ContainerStartOptions) error {
+	return nil
 }
 
 func (m *MockDocker) RemoveNetwork(ctx context.Context, networkName string) error { return nil }
@@ -99,11 +117,12 @@ type MockContainer struct {
 	state  ContainerState
 }
 
-func (m *MockContainer) ID() string                     { return m.id }
-func (m *MockContainer) Image() string                  { return m.image }
-func (m *MockContainer) Labels() map[string]string      { return m.labels }
-func (m *MockContainer) State() ContainerState          { return m.state }
-func (m *MockContainer) Stop(ctx context.Context) error { return nil }
+func (m *MockContainer) ID() string                      { return m.id }
+func (m *MockContainer) Image() string                   { return m.image }
+func (m *MockContainer) Labels() map[string]string       { return m.labels }
+func (m *MockContainer) State() ContainerState           { return m.state }
+func (m *MockContainer) Stop(ctx context.Context) error  { return nil }
+func (m *MockContainer) Start(ctx context.Context) error { return nil }
 
 func (m *MockContainer) Exec(ctx context.Context, cmd []string) (*ExecResult, error) {
 	return &ExecResult{}, nil
@@ -117,62 +136,63 @@ func (m *MockContainer) ExecStream(ctx context.Context, cmd []string, stdout, st
 	return 0, nil
 }
 
+// Helper to create test config
+func testConfig(name, network, image string) Config {
+	return Config{
+		Name:    name,
+		Network: NetworkConfig{Name: network},
+		Image:   ImageConfig{Name: image},
+	}
+}
+
+func testConfigWithIdle(name, network, image string, minIdle, maxIdle int) Config {
+	cfg := testConfig(name, network, image)
+	cfg.MinIdle = minIdle
+	cfg.MaxIdle = maxIdle
+	return cfg
+}
+
 func TestNewDockerPool(t *testing.T) {
 	tests := []struct {
 		name        string
-		poolName    string
-		networkName string
-		config      DockerPoolConfig
+		config      Config
 		wantErr     error
 		wantMinIdle int
 		wantMaxIdle int
 	}{
 		{
-			name:     "empty name returns error",
-			poolName: "",
-			wantErr:  ErrPoolNameRequired,
+			name:    "empty name returns error",
+			config:  testConfig("", "test-network", "alpine:latest"),
+			wantErr: ErrPoolNameRequired,
 		},
 		{
-			name:        "empty network returns error",
-			poolName:    "test-pool",
-			networkName: "",
-			wantErr:     ErrNetworkNameRequired,
+			name:    "empty network returns error",
+			config:  testConfig("test-pool", "", "alpine:latest"),
+			wantErr: ErrNetworkNameRequired,
 		},
 		{
-			name:        "valid name creates pool with defaults",
-			poolName:    "test-pool",
-			networkName: "test-network",
-			config:      DefaultDockerPoolConfig(),
+			name:    "empty image returns error",
+			config:  testConfig("test-pool", "test-network", ""),
+			wantErr: ErrImageRequired,
+		},
+		{
+			name:        "valid config creates pool with defaults",
+			config:      testConfig("test-pool", "test-network", "alpine:latest"),
 			wantMinIdle: 5,
 			wantMaxIdle: 10,
 		},
 		{
 			name:        "with custom min/max idle",
-			poolName:    "test-pool",
-			networkName: "test-network",
-			config: DockerPoolConfig{
-				MinIdle: 3,
-				MaxIdle: 6,
-			},
+			config:      testConfigWithIdle("test-pool", "test-network", "alpine:latest", 3, 6),
 			wantMinIdle: 3,
 			wantMaxIdle: 6,
-		},
-		{
-			name:        "with labels",
-			poolName:    "test-pool",
-			networkName: "test-network",
-			config: DockerPoolConfig{
-				Labels: map[string]string{"env": "test"},
-			},
-			wantMinIdle: 5,
-			wantMaxIdle: 10,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := &MockDocker{}
-			pool, err := NewDockerPool(context.Background(), mock, tt.poolName, tt.networkName, tt.config)
+			pool, err := NewWithDocker(context.Background(), mock, tt.config)
 
 			if tt.wantErr != nil {
 				assert.ErrorIs(t, err, tt.wantErr)
@@ -190,8 +210,7 @@ func TestNewDockerPool(t *testing.T) {
 
 			assert.Equal(t, tt.wantMinIdle, pool.minIdle)
 			assert.Equal(t, tt.wantMaxIdle, pool.maxIdle)
-			assert.Equal(t, tt.networkName, pool.networkName)
-			assert.Equal(t, tt.poolName, pool.containerConfig.Config.Labels[LabelPoolName])
+			assert.Equal(t, tt.config.Name, pool.containerConfig.Config.Labels[LabelPoolName])
 		})
 	}
 }
@@ -252,7 +271,7 @@ func TestPoolInitialization(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
 
-			pool, err := NewDockerPool(ctx, mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 2, MaxIdle: 5})
+			pool, err := NewWithDocker(ctx, mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 2, 5))
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -287,7 +306,7 @@ func TestAcquire(t *testing.T) {
 		{
 			name: "acquire from pool",
 			setupPool: func(p *DockerPool) {
-				p.pool.Push(&MockContainer{id: "pooled-container", state: StateRunning})
+				p.stack.Push(&MockContainer{id: "pooled-container", state: StateRunning})
 			},
 			wantContainerID: "pooled-container",
 		},
@@ -303,8 +322,19 @@ func TestAcquire(t *testing.T) {
 		{
 			name: "create container fails",
 			setupMock: func(m *MockDocker) {
+				var callCount atomic.Int32
 				m.CreateContainerFunc = func(ctx context.Context, networkName string, opts CreateContainerOptions) (Container, error) {
+					n := callCount.Add(1)
+					if n <= 2 {
+						return &MockContainer{id: fmt.Sprintf("init-%d", n), state: StateRunning}, nil
+					}
 					return nil, errors.New("create failed")
+				}
+			},
+			setupPool: func(p *DockerPool) {
+				// Drain the pool so Acquire has to create a new container
+				for p.stack.Len() > 0 {
+					p.stack.Pop()
 				}
 			},
 			wantErr: true,
@@ -318,7 +348,7 @@ func TestAcquire(t *testing.T) {
 				tt.setupMock(mock)
 			}
 
-			pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 2, MaxIdle: 5})
+			pool, err := NewWithDocker(context.Background(), mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 2, 5))
 			require.NoError(t, err)
 
 			// Cleanup watcher
@@ -350,7 +380,7 @@ func TestAcquire(t *testing.T) {
 func TestReturn(t *testing.T) {
 	t.Run("return to pool when not full", func(t *testing.T) {
 		mock := &MockDocker{}
-		pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 2, MaxIdle: 5})
+		pool, err := NewWithDocker(context.Background(), mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 2, 5))
 		require.NoError(t, err)
 
 		defer func() {
@@ -367,13 +397,13 @@ func TestReturn(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		assert.Equal(t, initialSize+1, pool.IdleCount()) // One more added
-		assert.Equal(t, 0, mock.RemoveContainerCalls)
+		assert.Equal(t, 0, mock.GetRemoveContainerCalls())
 		assert.Equal(t, int64(0), pool.InUse())
 	})
 
 	t.Run("remove when pool is full", func(t *testing.T) {
 		mock := &MockDocker{}
-		pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 2, MaxIdle: 5})
+		pool, err := NewWithDocker(context.Background(), mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 2, 5))
 		require.NoError(t, err)
 
 		defer func() {
@@ -384,7 +414,7 @@ func TestReturn(t *testing.T) {
 
 		// Fill pool to maxIdle
 		for pool.IdleCount() < 5 {
-			pool.pool.Push(&MockContainer{id: "c"})
+			pool.stack.Push(&MockContainer{id: "c"})
 		}
 
 		initialSize := pool.IdleCount()
@@ -394,15 +424,15 @@ func TestReturn(t *testing.T) {
 		pool.Return(context.Background(), container)
 		time.Sleep(10 * time.Millisecond)
 
-		assert.Equal(t, initialSize, pool.IdleCount()) // Size unchanged
-		assert.Equal(t, 1, mock.RemoveContainerCalls)  // Container removed
+		assert.Equal(t, initialSize, pool.IdleCount())     // Size unchanged
+		assert.Equal(t, 1, mock.GetRemoveContainerCalls()) // Container removed
 		assert.Equal(t, int64(0), pool.InUse())
 	})
 }
 
 func TestRemove(t *testing.T) {
 	mock := &MockDocker{}
-	pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DefaultDockerPoolConfig())
+	pool, err := NewWithDocker(context.Background(), mock, testConfig("test-pool", "test-network", "alpine:latest"))
 	require.NoError(t, err)
 
 	// Cleanup watcher
@@ -413,7 +443,7 @@ func TestRemove(t *testing.T) {
 	}()
 
 	initialSize := pool.IdleCount()
-	initialRemoveCalls := mock.RemoveContainerCalls
+	initialRemoveCalls := mock.GetRemoveContainerCalls()
 
 	pool.inUse.Store(1)
 	container := &MockContainer{id: "to-remove", state: StateRunning}
@@ -426,7 +456,7 @@ func TestRemove(t *testing.T) {
 	// Pool size should not change (Remove doesn't return to pool)
 	assert.Equal(t, initialSize, pool.IdleCount())
 	// One more remove call
-	assert.Equal(t, initialRemoveCalls+1, mock.RemoveContainerCalls)
+	assert.Equal(t, initialRemoveCalls+1, mock.GetRemoveContainerCalls())
 	assert.Equal(t, int64(0), pool.InUse())
 }
 
@@ -447,8 +477,8 @@ func TestShutdown(t *testing.T) {
 		{
 			name: "shutdown with containers in pool",
 			setupPool: func(p *DockerPool) {
-				p.pool.Push(&MockContainer{id: "c1"})
-				p.pool.Push(&MockContainer{id: "c2"})
+				p.stack.Push(&MockContainer{id: "c1"})
+				p.stack.Push(&MockContainer{id: "c2"})
 			},
 			ctxTimeout: time.Second,
 			wantEmpty:  true,
@@ -460,6 +490,7 @@ func TestShutdown(t *testing.T) {
 				go func() {
 					time.Sleep(50 * time.Millisecond)
 					p.inUse.Store(0)
+					p.containerReleased()
 				}()
 			},
 			ctxTimeout: time.Second,
@@ -479,7 +510,7 @@ func TestShutdown(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := &MockDocker{}
 
-			pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 2, MaxIdle: 5})
+			pool, err := NewWithDocker(context.Background(), mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 2, 5))
 			require.NoError(t, err)
 
 			if tt.setupPool != nil {
@@ -506,88 +537,64 @@ func TestShutdown(t *testing.T) {
 }
 
 func TestWithContainerConfig(t *testing.T) {
-	tests := []struct {
-		name      string
-		config    DockerPoolConfig
-		wantImage string
-	}{
-		{
-			name: "custom image",
-			config: DockerPoolConfig{
-				ContainerConfig: CreateContainerOptions{
-					Config: &container.Config{
-						Image: "python:3.11",
-					},
-				},
-			},
-			wantImage: "python:3.11",
-		},
-		{
-			name: "nil config gets default image",
-			config: DockerPoolConfig{
-				ContainerConfig: CreateContainerOptions{
-					Config: nil,
-				},
-			},
-			wantImage: "alpine:latest", // Default image is applied
-		},
-	}
+	t.Run("custom image from config", func(t *testing.T) {
+		mock := &MockDocker{}
+		cfg := testConfig("test-pool", "test-network", "python:3.11")
+		pool, err := NewWithDocker(context.Background(), mock, cfg)
+		require.NoError(t, err)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mock := &MockDocker{}
-			pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", tt.config)
-			require.NoError(t, err)
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer shutdownCancel()
+			pool.Shutdown(shutdownCtx)
+		}()
 
-			// Cleanup watcher
-			defer func() {
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-				defer shutdownCancel()
-				pool.Shutdown(shutdownCtx)
-			}()
+		assert.Equal(t, "python:3.11", pool.containerConfig.Config.Image)
+	})
 
-			assert.Equal(t, tt.wantImage, pool.containerConfig.Config.Image)
-		})
-	}
+	t.Run("custom container config overrides image", func(t *testing.T) {
+		mock := &MockDocker{}
+		cfg := testConfig("test-pool", "test-network", "alpine:latest")
+		cfg.ContainerConfig = &container.Config{
+			Image: "custom:image",
+			Cmd:   []string{"custom", "cmd"},
+		}
+		pool, err := NewWithDocker(context.Background(), mock, cfg)
+		require.NoError(t, err)
+
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer shutdownCancel()
+			pool.Shutdown(shutdownCtx)
+		}()
+
+		assert.Equal(t, "custom:image", pool.containerConfig.Config.Image)
+	})
 }
 
 func TestWithLabels(t *testing.T) {
-	tests := []struct {
-		name       string
-		config     DockerPoolConfig
-		wantLabels map[string]string
-	}{
-		{
-			name: "add custom labels",
-			config: DockerPoolConfig{
-				Labels: map[string]string{"env": "test", "app": "myapp"},
-			},
-			wantLabels: map[string]string{
-				"env":          "test",
-				"app":          "myapp",
-				LabelManagedBy: LabelManagedByValue,
-				LabelPoolName:  "test-pool",
-			},
-		},
+	mock := &MockDocker{}
+	cfg := testConfig("test-pool", "test-network", "alpine:latest")
+	cfg.Labels = map[string]string{"env": "test", "app": "myapp"}
+
+	pool, err := NewWithDocker(context.Background(), mock, cfg)
+	require.NoError(t, err)
+
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer shutdownCancel()
+		pool.Shutdown(shutdownCtx)
+	}()
+
+	wantLabels := map[string]string{
+		"env":          "test",
+		"app":          "myapp",
+		LabelManagedBy: LabelManagedByValue,
+		LabelPoolName:  "test-pool",
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mock := &MockDocker{}
-			pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", tt.config)
-			require.NoError(t, err)
-
-			// Cleanup watcher
-			defer func() {
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-				defer shutdownCancel()
-				pool.Shutdown(shutdownCtx)
-			}()
-
-			for k, v := range tt.wantLabels {
-				assert.Equal(t, v, pool.containerConfig.Config.Labels[k], "label %q mismatch", k)
-			}
-		})
+	for k, v := range wantLabels {
+		assert.Equal(t, v, pool.containerConfig.Config.Labels[k], "label %q mismatch", k)
 	}
 }
 
@@ -603,8 +610,7 @@ func TestSyncDockerPool(t *testing.T) {
 		}
 
 		// minIdle=2 but we already have 3 containers from sync
-		// so refill won't add more
-		pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 2, MaxIdle: 5})
+		pool, err := NewWithDocker(context.Background(), mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 2, 5))
 		require.NoError(t, err)
 
 		defer func() {
@@ -616,7 +622,7 @@ func TestSyncDockerPool(t *testing.T) {
 		// Pool should have at least 3 containers from sync
 		assert.GreaterOrEqual(t, pool.IdleCount(), 3)
 		// No new containers should be created since we have more than minIdle
-		assert.Equal(t, 0, mock.CreateContainerCalls)
+		assert.Equal(t, 0, mock.GetCreateContainerCalls())
 	})
 
 	t.Run("refills if synced containers less than minIdle", func(t *testing.T) {
@@ -628,8 +634,7 @@ func TestSyncDockerPool(t *testing.T) {
 		}
 
 		// minIdle=3 but we only have 1 container from sync
-		// so refill should add 2 more
-		pool, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DockerPoolConfig{MinIdle: 3, MaxIdle: 5})
+		pool, err := NewWithDocker(context.Background(), mock, testConfigWithIdle("test-pool", "test-network", "alpine:latest", 3, 5))
 		require.NoError(t, err)
 
 		defer func() {
@@ -640,7 +645,7 @@ func TestSyncDockerPool(t *testing.T) {
 
 		// Should have 3 containers (1 synced + 2 created)
 		assert.Equal(t, 3, pool.IdleCount())
-		assert.Equal(t, 2, mock.CreateContainerCalls)
+		assert.Equal(t, 2, mock.GetCreateContainerCalls())
 	})
 
 	t.Run("list error fails pool creation", func(t *testing.T) {
@@ -649,7 +654,7 @@ func TestSyncDockerPool(t *testing.T) {
 			return nil, errors.New("docker error")
 		}
 
-		_, err := NewDockerPool(context.Background(), mock, "test-pool", "test-network", DefaultDockerPoolConfig())
+		_, err := NewWithDocker(context.Background(), mock, testConfig("test-pool", "test-network", "alpine:latest"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "sync pool")
 	})

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"time"
 
 	"github.com/moby/moby/api/types/container"
@@ -22,17 +23,15 @@ type Docker interface {
 	// Ping checks connection to Docker daemon
 	Ping(ctx context.Context) error
 
-	// SetCleanupTimeout sets the timeout for cleanup operations
-	SetCleanupTimeout(timeout time.Duration)
-
 	// Image operations
 	PullImage(ctx context.Context, image string) error
 
 	// Network operations
-	EnsureNetwork(ctx context.Context, networkName string) (bool, error)
+	EnsureNetwork(ctx context.Context, networkName string, driver string, labels map[string]string) (bool, error)
 	RemoveNetwork(ctx context.Context, networkName string) error
 
 	// Container operations
+	StartContainer(ctx context.Context, containerID string, opts client.ContainerStartOptions) error
 	CreateContainer(ctx context.Context, networkName string, opts CreateContainerOptions) (Container, error)
 	StopContainer(ctx context.Context, containerID string, opts client.ContainerStopOptions) error
 	RemoveContainer(ctx context.Context, containerID string) error
@@ -46,12 +45,7 @@ type Docker interface {
 	ListContainersByLabels(ctx context.Context, labels ...Label) ([]Container, error)
 }
 
-var _ Docker = (*DockerClient)(nil)
-
-const (
-	// cleanupTimeout is the timeout for cleanup operations (container removal on error)
-	cleanupTimeout = 30 * time.Second
-)
+var _ Docker = (*dockerClient)(nil)
 
 // Labels for identifying pool containers
 const (
@@ -76,8 +70,8 @@ type ContainerState string
 // ExecResult contains the result of executing a command in a container
 type ExecResult struct {
 	ExitCode int
-	Stdout   string
-	Stderr   string
+	Stdout   []byte
+	Stderr   []byte
 }
 
 // ExecOptions contains options for executing a command in a container
@@ -93,39 +87,32 @@ type Label struct {
 	Value string
 }
 
-// DockerClient is the implementation of the Docker interface
-type DockerClient struct {
-	cli            client.APIClient
-	CleanupTimeout time.Duration
+// dockerClient is the implementation of the Docker interface
+type dockerClient struct {
+	cli client.APIClient
 }
 
-// NewDockerClient creates a new Docker client with default settings
-func NewDockerClient() (*DockerClient, error) {
-	return NewDockerClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+// newDockerClient creates a new Docker client with default settings
+func newDockerClient() (*dockerClient, error) {
+	return newDockerClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 }
 
-// NewDockerClientWithOpts creates a Docker client with custom options
-// Example:
-//
-//	client, err := NewDockerClientWithOpts(
-//	    client.WithHost("tcp://127.0.0.1:2375"),
-//	    client.WithAPIVersionNegotiation(),
-//	)
-func NewDockerClientWithOpts(opts ...client.Opt) (*DockerClient, error) {
+// newDockerClientWithOpts creates a Docker client with custom options
+func newDockerClientWithOpts(opts ...client.Opt) (*dockerClient, error) {
 	cli, err := client.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
 	}
-	return &DockerClient{cli: cli, CleanupTimeout: cleanupTimeout}, nil
+	return &dockerClient{cli: cli}, nil
 }
 
 // Close closes the connection to Docker
-func (d *DockerClient) Close() error {
+func (d *dockerClient) Close() error {
 	return d.cli.Close()
 }
 
 // Ping checks connection to Docker daemon
-func (d *DockerClient) Ping(ctx context.Context) error {
+func (d *dockerClient) Ping(ctx context.Context) error {
 	_, err := d.cli.Ping(ctx, client.PingOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to ping docker: %w", err)
@@ -133,13 +120,8 @@ func (d *DockerClient) Ping(ctx context.Context) error {
 	return nil
 }
 
-// SetCleanupTimeout sets the timeout for cleanup operations (container removal on error)
-func (d *DockerClient) SetCleanupTimeout(timeout time.Duration) {
-	d.CleanupTimeout = timeout
-}
-
 // PullImage pulls an image from a registry and waits for completion
-func (d *DockerClient) PullImage(ctx context.Context, image string) error {
+func (d *dockerClient) PullImage(ctx context.Context, image string) error {
 	resp, err := d.cli.ImagePull(ctx, image, client.ImagePullOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to pull image %s: %w", image, err)
@@ -155,20 +137,12 @@ func (d *DockerClient) PullImage(ctx context.Context, image string) error {
 
 // EnsureNetwork creates a network if it does not exist.
 // Returns true if the network was created, false if it already existed.
-func (d *DockerClient) EnsureNetwork(ctx context.Context, networkName string) (bool, error) {
-	// Check if network exists
-	_, err := d.cli.NetworkInspect(ctx, networkName, client.NetworkInspectOptions{})
-	if err == nil {
-		// Network already exists
-		return false, nil
-	}
-
-	// Create network
-	_, err = d.cli.NetworkCreate(ctx, networkName, client.NetworkCreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{
+func (d *dockerClient) EnsureNetwork(ctx context.Context, networkName string, driver string, labels map[string]string) (bool, error) {
+	_, err := d.cli.NetworkCreate(ctx, networkName, client.NetworkCreateOptions{
+		Driver: driver,
+		Labels: MergeLabels(labels, map[string]string{
 			LabelManagedBy: LabelManagedByValue,
-		},
+		}),
 	})
 	if err != nil {
 		return false, fmt.Errorf("failed to create network %s: %w", networkName, err)
@@ -178,7 +152,7 @@ func (d *DockerClient) EnsureNetwork(ctx context.Context, networkName string) (b
 }
 
 // RemoveNetwork removes a network
-func (d *DockerClient) RemoveNetwork(ctx context.Context, networkName string) error {
+func (d *dockerClient) RemoveNetwork(ctx context.Context, networkName string) error {
 	_, err := d.cli.NetworkRemove(ctx, networkName, client.NetworkRemoveOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to remove network %s: %w", networkName, err)
@@ -192,9 +166,17 @@ type CreateContainerOptions struct {
 	HostConfig *container.HostConfig // Host settings (volumes, network, resources, etc.)
 }
 
+func (d *dockerClient) StartContainer(ctx context.Context, containerID string, opts client.ContainerStartOptions) error {
+	_, err := d.cli.ContainerStart(ctx, containerID, opts)
+	if err != nil {
+		return fmt.Errorf("failed to start container %s: %w", containerID, err)
+	}
+	return nil
+}
+
 // CreateContainer creates and starts a container.
 // Returns the ID of the created container.
-func (d *DockerClient) CreateContainer(ctx context.Context, networkName string, opts CreateContainerOptions) (Container, error) {
+func (d *dockerClient) CreateContainer(ctx context.Context, networkName string, opts CreateContainerOptions) (Container, error) {
 	if opts.Config == nil || opts.Config.Image == "" {
 		return nil, ErrImageRequired
 	}
@@ -216,11 +198,13 @@ func (d *DockerClient) CreateContainer(ctx context.Context, networkName string, 
 	containerID := createResult.ID
 
 	// Start container
-	_, err = d.cli.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
+	err = d.StartContainer(ctx, containerID, client.ContainerStartOptions{})
 	if err != nil {
-		// If failed to start - remove the created container
-		d.cleanupContainer(containerID)
-		return nil, fmt.Errorf("failed to start container: %w", err)
+		startErr := fmt.Errorf("failed to start container: %w", err)
+		if cleanupErr := d.RemoveContainer(ctx, containerID); cleanupErr != nil {
+			return nil, fmt.Errorf("%w (cleanup also failed: %w)", startErr, cleanupErr)
+		}
+		return nil, startErr
 	}
 	container := NewContainerClient(ContainerOpts{
 		ID:     containerID,
@@ -234,7 +218,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, networkName string, 
 }
 
 // StopContainer stops a running container
-func (d *DockerClient) StopContainer(ctx context.Context, containerID string, opts client.ContainerStopOptions) error {
+func (d *dockerClient) StopContainer(ctx context.Context, containerID string, opts client.ContainerStopOptions) error {
 	_, err := d.cli.ContainerStop(ctx, containerID, opts)
 	if err != nil {
 		return fmt.Errorf("failed to stop container %s: %w", containerID, err)
@@ -243,12 +227,15 @@ func (d *DockerClient) StopContainer(ctx context.Context, containerID string, op
 }
 
 // RemoveContainer stops and removes a container
-func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) error {
-	// First try to stop (ignore error - container may already be stopped)
-	_, _ = d.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
+func (d *dockerClient) RemoveContainer(ctx context.Context, containerID string) error {
+	// First try to stop
+	_, err := d.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to stop container %s: %w", containerID, err)
+	}
 
 	// Then force remove
-	_, err := d.cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
+	_, err = d.cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
 		Force:         true,
 		RemoveVolumes: true,
 	})
@@ -260,66 +247,28 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 }
 
 // Exec executes a command in a container and returns the result
-func (d *DockerClient) Exec(ctx context.Context, containerID string, cmd []string) (*ExecResult, error) {
+func (d *dockerClient) Exec(ctx context.Context, containerID string, cmd []string) (*ExecResult, error) {
 	return d.ExecStd(ctx, containerID, cmd, ExecOptions{})
 }
 
 // ExecStd executes a command and returns output as strings in ExecResult.
 // Use ExecStream if you need to stream output to io.Writer.
-func (d *DockerClient) ExecStd(ctx context.Context, containerID string, cmd []string, opts ExecOptions) (*ExecResult, error) {
-	if opts.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
-	}
-
-	execCreateResult, err := d.cli.ExecCreate(ctx, containerID, client.ExecCreateOptions{
-		Cmd:          cmd,
-		AttachStdout: true,
-		AttachStderr: true,
-		AttachStdin:  opts.Stdin != nil,
-	})
+func (d *dockerClient) ExecStd(ctx context.Context, containerID string, cmd []string, opts ExecOptions) (*ExecResult, error) {
+	var stdout, stderr bytes.Buffer
+	exitCode, err := d.ExecStream(ctx, containerID, cmd, &stdout, &stderr, opts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create exec: %w", err)
+		return nil, fmt.Errorf("failed to execute command: %w", err)
 	}
-
-	execID := execCreateResult.ID
-
-	attachResult, err := d.cli.ExecAttach(ctx, execID, client.ExecAttachOptions{
-		TTY: false,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to attach to exec: %w", err)
-	}
-	defer attachResult.Close()
-
-	if opts.Stdin != nil {
-		go func() {
-			_, _ = io.Copy(attachResult.Conn, opts.Stdin)
-			_ = attachResult.CloseWrite()
-		}()
-	}
-
-	var stdoutBuf, stderrBuf bytes.Buffer
-	if err := decodeDockerStream(attachResult.Reader, opts.Limit, &stdoutBuf, &stderrBuf); err != nil {
-		return nil, fmt.Errorf("failed to read exec output: %w", err)
-	}
-
-	inspectResult, err := d.cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect exec: %w", err)
-	}
-
 	return &ExecResult{
-		ExitCode: inspectResult.ExitCode,
-		Stdout:   stdoutBuf.String(),
-		Stderr:   stderrBuf.String(),
+		ExitCode: exitCode,
+		Stdout:   stderr.Bytes(),
+		Stderr:   stderr.Bytes(),
 	}, nil
 }
 
 // ExecStream executes a command and streams output to provided writers.
 // Returns exit code directly. Use this for large outputs or real-time logging.
-func (d *DockerClient) ExecStream(ctx context.Context, containerID string, cmd []string, stdout, stderr io.Writer, opts ExecOptions) (int, error) {
+func (d *dockerClient) ExecStream(ctx context.Context, containerID string, cmd []string, stdout, stderr io.Writer, opts ExecOptions) (int, error) {
 	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
@@ -346,27 +295,30 @@ func (d *DockerClient) ExecStream(ctx context.Context, containerID string, cmd [
 	}
 	defer attachResult.Close()
 
+	errs := make(chan error, 1)
 	if opts.Stdin != nil {
 		go func() {
-			_, _ = io.Copy(attachResult.Conn, opts.Stdin)
+			_, err = io.Copy(attachResult.Conn, opts.Stdin)
 			_ = attachResult.CloseWrite()
+			errs <- err
+			close(errs)
 		}()
 	}
 
 	if err := decodeDockerStream(attachResult.Reader, opts.Limit, stdout, stderr); err != nil {
-		return -1, fmt.Errorf("failed to read exec output: %w", err)
+		return -1, fmt.Errorf("failed to read exec output %w: %w", err, <-errs)
 	}
 
 	inspectResult, err := d.cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
 	if err != nil {
-		return -1, fmt.Errorf("failed to inspect exec: %w", err)
+		return -1, fmt.Errorf("failed to inspect exec %w: %w", err, <-errs)
 	}
 
-	return inspectResult.ExitCode, nil
+	return inspectResult.ExitCode, <-errs
 }
 
 // ListContainersByLabels returns a list of containers with the specified labels (AND)
-func (d *DockerClient) ListContainersByLabels(ctx context.Context, labels ...Label) ([]Container, error) {
+func (d *dockerClient) ListContainersByLabels(ctx context.Context, labels ...Label) ([]Container, error) {
 	filters := client.Filters{}
 
 	for _, label := range labels {
@@ -409,18 +361,9 @@ func PoolLabels(poolName string) map[string]string {
 func MergeLabels(labelMaps ...map[string]string) map[string]string {
 	result := make(map[string]string)
 	for _, m := range labelMaps {
-		for k, v := range m {
-			result[k] = v
-		}
+		maps.Copy(result, m)
 	}
 	return result
-}
-
-// cleanupContainer removes a container with a timeout (for cleanup on errors)
-func (d *DockerClient) cleanupContainer(containerID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), d.CleanupTimeout)
-	defer cancel()
-	_ = d.RemoveContainer(ctx, containerID)
 }
 
 const (
@@ -433,7 +376,7 @@ const (
 func decodeDockerStream(reader io.Reader, limit int64, stdout, stderr io.Writer) error {
 	buf := make([]byte, initialBufSize)
 	if limit > 0 {
-		reader = io.LimitReader(reader, limit)
+		reader = &limitedReader{r: reader, limit: limit}
 	}
 	for {
 		// Read header (8 bytes)
@@ -463,9 +406,7 @@ func decodeDockerStream(reader io.Reader, limit int64, stdout, stderr io.Writer)
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return ErrOutputLimitExceeded
-			}
+
 			return err
 		}
 
@@ -481,4 +422,20 @@ func decodeDockerStream(reader io.Reader, limit int64, stdout, stderr io.Writer)
 			}
 		}
 	}
+}
+
+type limitedReader struct {
+	r     io.Reader
+	limit int64
+	read  int64
+}
+
+func (l *limitedReader) Read(p []byte) (n int, err error) {
+	n, err = l.r.Read(p)
+	l.read += int64(n)
+
+	if l.limit > 0 && l.read > l.limit {
+		return n, ErrOutputLimitExceeded
+	}
+	return
 }

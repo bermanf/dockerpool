@@ -14,4 +14,7 @@ var (
 
 	// ErrNetworkNameRequired is returned when network name is empty
 	ErrNetworkNameRequired = errors.New("network name is required")
+
+	// ErrPoolShutdown is returned when operations are attempted on a shut down pool
+	ErrPoolShutdown = errors.New("pool is shut down")
 )
