@@ -261,7 +261,7 @@ func (d *dockerClient) ExecStd(ctx context.Context, containerID string, cmd []st
 	}
 	return &ExecResult{
 		ExitCode: exitCode,
-		Stdout:   stderr.Bytes(),
+		Stdout:   stdout.Bytes(),
 		Stderr:   stderr.Bytes(),
 	}, nil
 }
@@ -298,20 +298,22 @@ func (d *dockerClient) ExecStream(ctx context.Context, containerID string, cmd [
 	errs := make(chan error, 1)
 	if opts.Stdin != nil {
 		go func() {
-			_, err = io.Copy(attachResult.Conn, opts.Stdin)
+			_, stdinErr := io.Copy(attachResult.Conn, opts.Stdin)
 			_ = attachResult.CloseWrite()
-			errs <- err
+			errs <- stdinErr
 			close(errs)
 		}()
+	} else {
+		close(errs)
 	}
 
 	if err := decodeDockerStream(attachResult.Reader, opts.Limit, stdout, stderr); err != nil {
-		return -1, fmt.Errorf("failed to read exec output %w: %w", err, <-errs)
+		return -1, errors.Join(fmt.Errorf("failed to read exec output: %w", err), <-errs)
 	}
 
 	inspectResult, err := d.cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
 	if err != nil {
-		return -1, fmt.Errorf("failed to inspect exec %w: %w", err, <-errs)
+		return -1, errors.Join(fmt.Errorf("failed to inspect exec: %w", err), <-errs)
 	}
 
 	return inspectResult.ExitCode, <-errs

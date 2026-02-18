@@ -26,7 +26,6 @@ type Config struct {
 	RefillInterval         time.Duration // pool refill check interval (default: 100ms)
 	MaxConcurrentDockerOps int           // max parallel docker operations (default: 10)
 	MaxConcurrentAcquire   int           // max parallel container acquisition (default: 10)
-	MaxRefillWorkers       int           // max parallel container creation goroutines (default: 5)
 
 	// Advanced - for custom container configuration
 	ContainerConfig *container.Config     // custom container config (overrides Image, Cmd)
@@ -141,7 +140,7 @@ func newDockerPool(ctx context.Context, docker Docker, cfg Config) (*DockerPool,
 		stack:  NewStack[Container](),
 		config: cfg,
 
-		released: make(chan struct{}),
+		released: make(chan struct{}, 1),
 	}
 
 	applyConfig(p, cfg)
@@ -186,8 +185,8 @@ func applyConfig(p *DockerPool, cfg Config) {
 	if cfg.MaxConcurrentAcquire == 0 {
 		cfg.MaxConcurrentAcquire = 10
 	}
-	if cfg.MaxRefillWorkers == 0 {
-		cfg.MaxRefillWorkers = 5
+	if cfg.MaxConcurrentAcquire == 0 {
+		cfg.MaxConcurrentAcquire = 1
 	}
 	if len(cfg.Cmd) == 0 {
 		cfg.Cmd = []string{"sleep", "infinity"}

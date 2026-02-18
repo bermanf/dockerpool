@@ -2,7 +2,6 @@ package dockerpool
 
 import (
 	"sync"
-	"sync/atomic"
 )
 
 // Stack is a thread-safe LIFO stack.
@@ -20,9 +19,9 @@ type stackNode[T any] struct {
 }
 
 type stack[T any] struct {
-	mu sync.Mutex
+	rw sync.RWMutex
 
-	length atomic.Int32
+	length int
 	head   *stackNode[T]
 }
 
@@ -32,29 +31,32 @@ func NewStack[T any]() Stack[T] {
 }
 
 func (s *stack[T]) Push(elem T) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.rw.Lock()
+	defer s.rw.Unlock()
 
 	node := &stackNode[T]{elem: elem}
 	node.next = s.head
 	s.head = node
-	s.length.Add(1)
+	s.length += 1
 }
 
 func (s *stack[T]) Pop() (elem T, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.rw.Lock()
+	defer s.rw.Unlock()
 
 	if s.head == nil {
 		return
 	}
 	elem = s.head.elem
 	s.head = s.head.next
-	s.length.Add(-1)
+	s.length += -1
 
 	return elem, true
 }
 
 func (s *stack[T]) Len() int {
-	return int(s.length.Load())
+	s.rw.RLock()
+	defer s.rw.RUnlock()
+
+	return s.length
 }

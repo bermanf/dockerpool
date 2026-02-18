@@ -3,6 +3,7 @@ package dockerpool
 import (
 	"context"
 	"io"
+	"sync"
 
 	"github.com/moby/moby/client"
 )
@@ -27,6 +28,8 @@ type ContainerClient struct {
 	image  string
 	labels map[string]string
 	state  ContainerState
+
+	rw sync.RWMutex
 }
 type ContainerOpts struct {
 	Docker Docker
@@ -47,18 +50,30 @@ func NewContainerClient(opts ContainerOpts) Container {
 }
 
 func (c *ContainerClient) ID() string {
+	c.rw.RLock()
+	defer c.rw.RUnlock()
+
 	return c.id
 }
 
 func (c *ContainerClient) Image() string {
+	c.rw.RLock()
+	defer c.rw.RUnlock()
+
 	return c.image
 }
 
 func (c *ContainerClient) Labels() map[string]string {
+	c.rw.RLock()
+	defer c.rw.RUnlock()
+
 	return c.labels
 }
 
 func (c *ContainerClient) State() ContainerState {
+	c.rw.RLock()
+	defer c.rw.RUnlock()
+
 	return c.state
 }
 
@@ -67,7 +82,10 @@ func (c *ContainerClient) Stop(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.rw.Lock()
 	c.state = StateExited
+	c.rw.Unlock()
+
 	return nil
 }
 
@@ -76,7 +94,10 @@ func (c *ContainerClient) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.rw.Lock()
 	c.state = StateRunning
+	c.rw.Unlock()
+
 	return nil
 }
 
